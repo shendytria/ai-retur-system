@@ -3,14 +3,20 @@ import numpy as np
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sklearn.ensemble import GradientBoostingClassifier
-from database import engine, SessionLocal
+from database import engine, SessionLocal, Base
 from models import SkuMaster, Transaksi, SkorRisiko
+# [THRESHOLD] threshold dibaca dari tabel pengaturan (diubah Data/AI Admin lewat dashboard)
+from pengaturan import ensure_defaults, get_threshold, get_normal_label
 
 db = SessionLocal()
 
+# Pastikan tabel pengaturan ada (aman jika skrip ini dijalankan sebelum backend)
+Base.metadata.create_all(bind=engine)
+ensure_defaults(db)
+
 print("1. Mengambil data transaksi dari PostgreSQL...")
 query = """
-SELECT 
+SELECT
     t.sku_id,
     s.sku_code,
     s.product_name,
@@ -59,10 +65,12 @@ clf.fit(X, y)
 # Hitung probabilitas risiko (0.0000 - 1.0000)
 summary['risk_score'] = clf.predict_proba(X)[:, 1]
 
-# Ambil threshold (default 0.50 atau sesuai kesepakatan Admin)
-THRESHOLD = 0.50
+# [THRESHOLD] Ambil threshold & label status dari database (bukan lagi nilai tetap 0.50)
+THRESHOLD = get_threshold(db)
+NORMAL_LABEL = get_normal_label(db)
+print(f"   Threshold yang dipakai: {THRESHOLD:.2%} (diatur Data/AI Admin)")
 summary['status_threshold'] = summary['risk_score'].apply(
-    lambda score: 'HIGH RISK' if score >= THRESHOLD else 'NORMAL'
+    lambda score: 'HIGH RISK' if score >= THRESHOLD else NORMAL_LABEL
 )
 
 print("4. Menyimpan hasil skor risiko ke database (tabel skor_risiko)...")
