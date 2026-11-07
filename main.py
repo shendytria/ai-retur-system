@@ -13,12 +13,15 @@ from auth import router as auth_router, get_current_user, require_permission, wr
 from mitigasi import Mitigasi, ACTION_TYPES, mitigasi_info, fmt_waktu
 # [THRESHOLD] pengaturan ambang batas risiko (bisa diubah Data/AI Admin)
 from pengaturan import ensure_defaults, get_threshold, count_high, apply_threshold, Pengaturan
+# [NOTIF] notifikasi SKU melewati threshold untuk Supply Chain
+from notifikasi import Notifikasi, sync_notifikasi, STATUS_BARU, STATUS_DITERIMA
 
 # Buat tabel yang belum ada (users, audit_log, mitigasi). Tabel lama tidak diubah.
 Base.metadata.create_all(bind=engine)
 # [THRESHOLD] isi nilai awal threshold (diambil dari data skor yang sudah ada) bila belum ada
 with Session(engine) as _db:
     ensure_defaults(_db)
+    sync_notifikasi(_db)  # [NOTIF] samakan notifikasi dengan skor/threshold saat ini
 
 app = FastAPI(title="Sistem AI Prediksi Risiko Retur Obsolete")
 
@@ -155,14 +158,94 @@ def update_threshold(
         raise HTTPException(status_code=422, detail="Threshold harus di antara 0 dan 1 (mis. 0.6 untuk 60%).")
 
     hasil = apply_threshold(db, round(body.threshold, 4), by=f"{user.full_name} ({user.username})")
+    notif = sync_notifikasi(db)  # [NOTIF] SKU yang baru melewati threshold -> notifikasi baru
     write_audit(
         db, "UPDATE", "threshold",
         f"threshold {hasil['old_threshold']:.2f} -> {hasil['new_threshold']:.2f} | "
         f"HIGH RISK {hasil['high_risk_before']} -> {hasil['high_risk_after']} | "
-        f"{hasil['rows_changed']} baris skor diperbarui",
+        f"{hasil['rows_changed']} baris skor diperbarui | "
+        f"notifikasi baru {notif['created']}, ditutup {notif['closed']}",
         user=user, request=request,
     )
-    return {"message": "Threshold berhasil diubah dan status skor dihitung ulang", **hasil}
+    return {"message": "Threshold berhasil diubah dan status skor dihitung ulang", **hasil, "notifikasi": notif}
+
+def _notif_json(n: Notifikasi, mitigated: set) -> dict:
+    return {
+        "id": n.id,
+        "sku_code": n.sku_code,
+        "product_name": n.product_name,
+        "sumber": n.sumber or "-",
+        "risk_score": float(n.skor),
+        "estimasi_nilai_risiko": float(n.estimasi_nilai_risiko),
+        "status": n.status,
+        "created_at": fmt_waktu(n.created_at),
+        "accepted_by": n.accepted_by,
+        "accepted_at": fmt_waktu(n.accepted_at) if n.accepted_at else None,
+        "is_mitigated": n.sku_code in mitigated,
+    }
+
+@app.get("/api/notifikasi")
+def list_notifikasi(
+    status: str = "BARU",  # BARU | DITERIMA | ALL
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user=Depends(require_permission("notifikasi_accept")),  # [AUTH] hanya Supply Chain / Gudang
+):
+    """Notifikasi aktif untuk Supply Chain, diurutkan dari estimasi nilai risiko terbesar."""
+    base = db.query(Notifikasi).filter(Notifikasi.aktif.is_(True))
+    baru_count = base.filter(Notifikasi.status == STATUS_BARU).count()
+    diterima_count = base.filter(Notifikasi.status == STATUS_DITERIMA).count()
+
+    q = base
+    if status.upper() in (STATUS_BARU, STATUS_DITERIMA):
+        q = q.filter(Notifikasi.status == status.upper())
+    rows = q.order_by(Notifikasi.estimasi_nilai_risiko.desc(), Notifikasi.id).limit(max(1, min(limit, 500))).all()
+    mitigated = {m.sku_code for m in db.query(Mitigasi.sku_code).all()}
+    return {
+        "items": [_notif_json(n, mitigated) for n in rows],
+        "baru_count": baru_count,
+        "diterima_count": diterima_count,
+    }
+
+@app.post("/api/notifikasi/terima-semua")
+def terima_semua_notifikasi(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(require_permission("notifikasi_accept")),
+):
+    pic = f"{user.full_name} ({user.username})"
+    jumlah = (
+        db.query(Notifikasi)
+        .filter(Notifikasi.aktif.is_(True), Notifikasi.status == STATUS_BARU)
+        .update(
+            {Notifikasi.status: STATUS_DITERIMA, Notifikasi.accepted_by: pic,
+             Notifikasi.accepted_by_id: user.id, Notifikasi.accepted_at: func.now()},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    write_audit(db, "ACCEPT", "notifikasi", f"Menerima semua notifikasi baru ({jumlah})", user=user, request=request)
+    return {"message": f"{jumlah} notifikasi diterima", "jumlah": jumlah}
+
+@app.post("/api/notifikasi/{notif_id}/terima")
+def terima_notifikasi(
+    notif_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(require_permission("notifikasi_accept")),
+):
+    n = db.get(Notifikasi, notif_id)
+    if n is None or not n.aktif:
+        raise HTTPException(status_code=404, detail="Notifikasi tidak ditemukan atau sudah tidak aktif.")
+    if n.status == STATUS_DITERIMA:
+        raise HTTPException(status_code=409, detail=f"Notifikasi sudah diterima oleh {n.accepted_by}.")
+    n.status = STATUS_DITERIMA
+    n.accepted_by_id = user.id
+    n.accepted_by = f"{user.full_name} ({user.username})"
+    n.accepted_at = func.now()  # waktu dari server
+    db.commit()
+    write_audit(db, "ACCEPT", "notifikasi", f"{n.sku_code} | skor {float(n.skor):.2%}", user=user, request=request)
+    return {"message": "Notifikasi diterima"}
 
 @app.post("/api/mitigasi")
 def create_mitigasi(

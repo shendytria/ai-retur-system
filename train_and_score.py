@@ -89,6 +89,11 @@ for _, row in summary.iterrows():
 
 db.bulk_save_objects(batch_skor)
 db.commit()
+
+# [NOTIF] buat notifikasi untuk SKU yang baru berisiko tinggi, tutup yang sudah tidak berisiko
+from notifikasi import sync_notifikasi
+notif = sync_notifikasi(db)
+print(f"   Notifikasi: {notif['created']} baru, {notif['closed']} ditutup, {notif['updated']} diperbarui.")
 db.close()
 
 high_risk_count = (summary['status_threshold'] == 'HIGH RISK').sum()

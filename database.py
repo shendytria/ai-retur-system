@@ -1,8 +1,9 @@
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Koneksi ke container postgresql yang baru dibuat
-DATABASE_URL = "postgresql://postgres:secret@localhost:5433/retur_db"
+# Koneksi ke container PostgreSQL khusus proyek ini (port 5434 - zero risk terhadap database lain)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5434/retur_db")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
