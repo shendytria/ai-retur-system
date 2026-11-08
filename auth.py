@@ -52,6 +52,10 @@ class User(Base):
     last_login_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    @property
+    def role_label(self) -> str:
+        return ROLE_LABELS.get(self.role, self.role)
+
 
 class AuditLog(Base):
     """Audit trail (ALCOA): siapa, kapan, apa. Hanya di-insert, tidak pernah di-update."""

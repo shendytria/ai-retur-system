@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_, select, case
+from datetime import date
 from pydantic import BaseModel
 from typing import Optional
 
@@ -15,6 +16,8 @@ from mitigasi import Mitigasi, ACTION_TYPES, mitigasi_info, fmt_waktu
 from pengaturan import ensure_defaults, get_threshold, count_high, apply_threshold, Pengaturan
 # [NOTIF] notifikasi SKU melewati threshold untuk Supply Chain
 from notifikasi import Notifikasi, sync_notifikasi, STATUS_BARU, STATUS_DITERIMA
+# [LAPORAN] modul dampak finansial mitigasi & ekspor Excel/PDF
+from laporan import hitung_laporan_dampak, generate_excel_laporan, generate_pdf_laporan
 
 # Buat tabel yang belum ada (users, audit_log, mitigasi). Tabel lama tidak diubah.
 Base.metadata.create_all(bind=engine)
@@ -46,23 +49,126 @@ class MitigasiCreate(BaseModel):
     user_pic: Optional[str] = None  # [AUTH] diabaikan; PIC diambil dari user yang login
     notes: Optional[str] = None
 
+# [FILTER] Filter dashboard (URS: per area, produk, dan periode).
+# - sumber  : sumber data transaksi (Kalbe / Saka). Dipakai sebagai pengganti "area" karena
+#             sku_master belum punya kolom area.
+# - kategori: kategori produk. - q: cari nama produk / kode SKU.
+# - date_from/date_to: periode berdasarkan tanggal transaksi. Berlaku untuk angka penjualan, retur,
+#             dan komposisi alasan retur. Skor risiko dihitung per "2026-YTD" (satu periode), jadi
+#             tidak ikut difilter periode.
+class DashboardFilter:
+    def __init__(self, sumber=None, kategori=None, q=None, date_from=None, date_to=None):
+        self.sumber, self.kategori, self.q = sumber, kategori, q
+        self.date_from, self.date_to = date_from, date_to
+
+def dashboard_filters(
+    sumber: Optional[str] = None,
+    kategori: Optional[str] = None,
+    q: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> DashboardFilter:
+    clean = lambda v: (v.strip() or None) if v else None
+
+    def parse_date(v: Optional[str], nama: str) -> Optional[date]:
+        v = clean(v)  # parameter kosong dianggap tidak diisi
+        if v is None:
+            return None
+        try:
+            return date.fromisoformat(v)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"{nama} tidak valid. Gunakan format YYYY-MM-DD.")
+
+    d_from, d_to = parse_date(date_from, "Tanggal awal"), parse_date(date_to, "Tanggal akhir")
+    if d_from and d_to and d_from > d_to:
+        raise HTTPException(status_code=422, detail="Tanggal awal tidak boleh setelah tanggal akhir.")
+    return DashboardFilter(clean(sumber), clean(kategori), clean(q), d_from, d_to)
+
+def _produk_conditions(f: DashboardFilter) -> list:
+    """Kondisi pada SkuMaster dari filter kategori dan pencarian produk."""
+    conds = []
+    if f.kategori:
+        conds.append(func.coalesce(SkuMaster.catagory, "OTC") == f.kategori)
+    if f.q:
+        like = f"%{f.q}%"
+        conds.append(or_(SkuMaster.product_name.ilike(like), SkuMaster.sku_code.ilike(like)))
+    return conds
+
+def _sku_conditions(f: DashboardFilter) -> list:
+    """Kondisi pada SkuMaster, termasuk sumber (SKU yang punya transaksi dari sumber itu)."""
+    conds = _produk_conditions(f)
+    if f.sumber:
+        conds.append(SkuMaster.id.in_(select(Transaksi.sku_id).where(Transaksi.source == f.sumber)))
+    return conds
+
+def _tx_conditions(f: DashboardFilter) -> list:
+    """Kondisi pada Transaksi (sumber, periode, dan produk)."""
+    conds = []
+    if f.sumber:
+        conds.append(Transaksi.source == f.sumber)
+    if f.date_from:
+        conds.append(Transaksi.transaction_date >= f.date_from)
+    if f.date_to:
+        conds.append(Transaksi.transaction_date <= f.date_to)
+    produk = _produk_conditions(f)
+    if produk:
+        conds.append(Transaksi.sku_id.in_(select(SkuMaster.id).where(*produk)))
+    return conds
+
+@app.get("/api/dashboard/filter-options")
+def get_filter_options(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Pilihan untuk dropdown filter, diambil dari data yang ada."""
+    sumber = [r[0] for r in db.query(Transaksi.source).filter(Transaksi.source.isnot(None)).distinct().order_by(Transaksi.source).all()]
+    kategori_expr = func.coalesce(SkuMaster.catagory, "OTC")
+    kategori = [r[0] for r in db.query(kategori_expr).distinct().order_by(kategori_expr).all()]
+    tmin, tmax = db.query(func.min(Transaksi.transaction_date), func.max(Transaksi.transaction_date)).one()
+    return {
+        "sumber": sumber,
+        "kategori": kategori,
+        "tanggal_min": tmin.isoformat() if tmin else None,
+        "tanggal_max": tmax.isoformat() if tmax else None,
+    }
+
 @app.get("/api/dashboard/summary")
-def get_dashboard_summary(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    total_sku = db.query(SkuMaster).count()
-    high_risk_sku = db.query(SkorRisiko).filter(SkorRisiko.status_threshold == "HIGH RISK").count()
-    total_retur_val = db.query(func.sum(Transaksi.amount)).filter(Transaksi.type == "RETURN").scalar() or 0
-    total_sales_val = db.query(func.sum(Transaksi.amount)).filter(Transaksi.type == "SALES").scalar() or 0
+def get_dashboard_summary(
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    sku_conds = _sku_conditions(f)
+    tx_conds = _tx_conditions(f)
+
+    total_sku = db.query(SkuMaster).filter(*sku_conds).count()
+    high_risk_sku = (
+        db.query(SkorRisiko)
+        .join(SkuMaster, SkuMaster.id == SkorRisiko.sku_id)
+        .filter(SkorRisiko.status_threshold == "HIGH RISK", *sku_conds)
+        .count()
+    )
+    total_retur_val = db.query(func.sum(Transaksi.amount)).filter(Transaksi.type == "RETURN", *tx_conds).scalar() or 0
+    total_sales_val = db.query(func.sum(Transaksi.amount)).filter(Transaksi.type == "SALES", *tx_conds).scalar() or 0
+    mitigasi_count = (
+        db.query(Mitigasi)
+        .join(SkuMaster, SkuMaster.id == Mitigasi.sku_id)
+        .filter(*sku_conds)
+        .count()  # [MITIGASI] dari database
+    )
 
     return {
         "total_sku": total_sku,
         "high_risk_sku_count": high_risk_sku,
         "total_sales_rupiah": abs(float(total_sales_val)),
         "total_return_rupiah": abs(float(total_retur_val)),
-        "mitigasi_count": db.query(Mitigasi).count()  # [MITIGASI] dari database
+        "mitigasi_count": mitigasi_count,
     }
 
 @app.get("/api/dashboard/high-risk-skus")
-def get_high_risk_skus(status_filter: str = "ALL", db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_high_risk_skus(
+    status_filter: str = "ALL",
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     query = (
         db.query(
             SkuMaster.sku_code,
@@ -72,10 +178,11 @@ def get_high_risk_skus(status_filter: str = "ALL", db: Session = Depends(get_db)
             SkorRisiko.status_threshold
         )
         .join(SkorRisiko, SkuMaster.id == SkorRisiko.sku_id)
+        .filter(*_sku_conditions(f))
     )
     if status_filter == "HIGH_RISK":
         query = query.filter(SkorRisiko.status_threshold == "HIGH RISK")
-    
+
     results = query.order_by(SkorRisiko.skor.desc()).all()
     # [MITIGASI] baca dari database
     mitigated_codes = {m.sku_code: mitigasi_info(m) for m in db.query(Mitigasi).all()}
@@ -94,11 +201,15 @@ def get_high_risk_skus(status_filter: str = "ALL", db: Session = Depends(get_db)
     ]
 
 @app.get("/api/dashboard/chart-alasan-retur")
-def get_chart_alasan_retur(db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_chart_alasan_retur(
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     """Data agregat untuk Pie/Donut Chart breakdown alasan retur"""
     results = (
         db.query(Transaksi.alasan_retur, func.sum(func.abs(Transaksi.amount)))
-        .filter(Transaksi.type == "RETURN", Transaksi.alasan_retur.isnot(None))
+        .filter(Transaksi.type == "RETURN", Transaksi.alasan_retur.isnot(None), *_tx_conditions(f))
         .group_by(Transaksi.alasan_retur)
         .all()
     )
@@ -109,11 +220,16 @@ def get_chart_alasan_retur(db: Session = Depends(get_db), user=Depends(get_curre
     ]
 
 @app.get("/api/dashboard/chart-top-risk")
-def get_chart_top_risk(db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_chart_top_risk(
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     """Data 6 SKU dengan risiko tertinggi untuk Bar Chart"""
     results = (
         db.query(SkuMaster.product_name, SkorRisiko.skor)
         .join(SkorRisiko, SkuMaster.id == SkorRisiko.sku_id)
+        .filter(*_sku_conditions(f))
         .order_by(SkorRisiko.skor.desc())
         .limit(6)
         .all()
@@ -122,6 +238,56 @@ def get_chart_top_risk(db: Session = Depends(get_db), user=Depends(get_current_u
         {"name": r.product_name[:22] + "...", "score": round(float(r.skor) * 100, 1)}
         for r in results
     ]
+
+@app.get("/api/dashboard/chart-tren-bulanan")
+def get_chart_tren_bulanan(
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Data tren bulanan nilai penjualan dan nilai retur untuk grafik Area/Line (URS: Tren Bulanan)"""
+    if engine.dialect.name == "sqlite":
+        bulan_expr = func.strftime("%Y-%m", Transaksi.transaction_date)
+    else:
+        bulan_expr = func.to_char(Transaksi.transaction_date, "YYYY-MM")
+
+    conds = [Transaksi.transaction_date.isnot(None)] + _tx_conditions(f)
+
+    sales_sum = func.sum(case((Transaksi.type == "SALES", Transaksi.amount), else_=0))
+    retur_sum = func.sum(case((Transaksi.type == "RETURN", func.abs(Transaksi.amount)), else_=0))
+
+    results = (
+        db.query(
+            bulan_expr.label("bulan"),
+            sales_sum.label("total_sales"),
+            retur_sum.label("total_retur"),
+        )
+        .filter(*conds)
+        .group_by(bulan_expr)
+        .order_by(bulan_expr.asc())
+        .all()
+    )
+
+    bulan_names = {
+        "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr",
+        "05": "Mei", "06": "Jun", "07": "Jul", "08": "Agu",
+        "09": "Sep", "10": "Okt", "11": "Nov", "12": "Des"
+    }
+
+    data = []
+    for r in results:
+        b = r.bulan
+        if not b:
+            continue
+        parts = b.split("-")
+        label = f"{bulan_names.get(parts[1], parts[1])} {parts[0]}" if len(parts) == 2 else b
+        data.append({
+            "bulan": b,
+            "label": label,
+            "sales": abs(float(r.total_sales or 0)),
+            "retur": abs(float(r.total_retur or 0)),
+        })
+    return data
 
 @app.get("/api/threshold")
 def read_threshold(db: Session = Depends(get_db), user=Depends(get_current_user)):
@@ -309,3 +475,102 @@ def create_mitigasi(
     # [AUTH] audit trail: siapa, kapan, apa
     write_audit(db, audit_action, "mitigasi", audit_detail, user=user, request=request)
     return {"message": message, "data": mitigasi_info(record)}
+
+
+@app.post("/api/mitigasi/seed-demo")
+def seed_demo_mitigasi(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Seed contoh data mitigasi pada SKU High Risk untuk keperluan demonstrasi laporan dampak."""
+    from seed_mitigasi import seed_sample_mitigasi
+    total = seed_sample_mitigasi(db)
+    write_audit(db, "CREATE", "mitigasi", f"Generate {total} data simulasi mitigasi", user=user, request=request)
+    return {"message": f"{total} contoh mitigasi berhasil ditambahkan.", "total": total}
+
+
+# ---------------------------------------------------------------------------
+# [LAPORAN DAMPAK] Khusus Manajemen & Data / AI Admin (URS: Laporan Dampak)
+# ---------------------------------------------------------------------------
+@app.get("/api/laporan-dampak")
+def get_laporan_dampak(
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(require_permission("laporan_export")),  # Hanya Manajemen & Data/AI Admin
+):
+    """
+    Menampilkan ringkasan dampak finansial sebelum & sesudah mitigasi,
+    serta rincian per SKU (URS: Laporan Dampak Finansial).
+    """
+    return hitung_laporan_dampak(db, filter_obj=f)
+
+
+@app.get("/api/laporan-dampak/export/excel")
+def export_laporan_excel(
+    request: Request,
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(require_permission("laporan_export")),  # Hanya Manajemen & Data/AI Admin
+):
+    """Ekspor Laporan Dampak Finansial Mitigasi ke Excel (.xlsx) dengan standar ALCOA."""
+    data = hitung_laporan_dampak(db, filter_obj=f)
+    role_label = getattr(user, "role_label", user.role)
+    user_str = f"{user.full_name} ({role_label})"
+    xlsx_bytes = generate_excel_laporan(data, user_str)
+
+    # Catat aktivitas ekspor ke audit trail (ALCOA: Attributable & Accurate)
+    write_audit(
+        db,
+        "EXPORT",
+        "laporan_dampak",
+        f"Ekspor Excel (.xlsx) | {data['summary']['total_sku_mitigasi']} SKU | "
+        f"Penghematan: Rp {int(data['summary']['total_penghematan']):,}",
+        user=user,
+        request=request,
+    )
+
+    filename = f"Laporan_Dampak_Mitigasi_{date.today().strftime('%Y%m%d')}.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
+@app.get("/api/laporan-dampak/export/pdf")
+def export_laporan_pdf(
+    request: Request,
+    f: DashboardFilter = Depends(dashboard_filters),
+    db: Session = Depends(get_db),
+    user=Depends(require_permission("laporan_export")),  # Hanya Manajemen & Data/AI Admin
+):
+    """Ekspor Laporan Dampak Finansial Mitigasi ke PDF (.pdf) resmi ALCOA."""
+    data = hitung_laporan_dampak(db, filter_obj=f)
+    role_label = getattr(user, "role_label", user.role)
+    user_str = f"{user.full_name} ({role_label})"
+    pdf_bytes = generate_pdf_laporan(data, user_str)
+
+    # Catat aktivitas ekspor ke audit trail (ALCOA: Attributable & Accurate)
+    write_audit(
+        db,
+        "EXPORT",
+        "laporan_dampak",
+        f"Ekspor PDF (.pdf) | {data['summary']['total_sku_mitigasi']} SKU | "
+        f"Penghematan: Rp {int(data['summary']['total_penghematan']):,}",
+        user=user,
+        request=request,
+    )
+
+    filename = f"Laporan_Dampak_Mitigasi_{date.today().strftime('%Y%m%d')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
